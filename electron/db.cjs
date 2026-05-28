@@ -147,9 +147,11 @@ function rebuildCoreTables(database, schemaState) {
         hsn TEXT NOT NULL,
         quantity REAL NOT NULL,
         gross_weight REAL NOT NULL,
+        stone_weight REAL NOT NULL DEFAULT 0,
         total_weight REAL NOT NULL,
         unit_price REAL NOT NULL,
         making_charge REAL NOT NULL DEFAULT 0,
+        other_charges REAL NOT NULL DEFAULT 0,
         line_total REAL NOT NULL,
         PRIMARY KEY (sale_id, line_index),
         FOREIGN KEY (sale_id) REFERENCES sales_next(id) ON DELETE CASCADE,
@@ -193,8 +195,8 @@ function rebuildCoreTables(database, schemaState) {
       SELECT id, invoice_number, date, customer_id, customer_name, customer_phone, customer_address, tax_rate, separate_rate_and_making_charge, subtotal, discount, tax_amount, total, paid_amount, balance_amount, payment_mode, notes
       FROM sales;
 
-      INSERT INTO sale_items_next (sale_id, line_index, product_id, product_name, hsn, quantity, gross_weight, total_weight, unit_price, making_charge, line_total)
-      SELECT sale_id, line_index, product_id, product_name, hsn, quantity, gross_weight, total_weight, unit_price, making_charge, line_total
+      INSERT INTO sale_items_next (sale_id, line_index, product_id, product_name, hsn, quantity, gross_weight, stone_weight, total_weight, unit_price, making_charge, other_charges, line_total)
+      SELECT sale_id, line_index, product_id, product_name, hsn, quantity, gross_weight, stone_weight, total_weight, unit_price, making_charge, other_charges, line_total
       FROM sale_items;
 
       INSERT INTO outstandings_next (id, sale_id, invoice_number, date, customer_id, customer_name, balance_amount, paid_amount, status, settlements_json)
@@ -329,9 +331,11 @@ function ensureSchema(database) {
       hsn TEXT NOT NULL,
       quantity REAL NOT NULL,
       gross_weight REAL NOT NULL,
+      stone_weight REAL NOT NULL DEFAULT 0,
       total_weight REAL NOT NULL,
       unit_price REAL NOT NULL,
       making_charge REAL NOT NULL DEFAULT 0,
+      other_charges REAL NOT NULL DEFAULT 0,
       line_total REAL NOT NULL,
       PRIMARY KEY (sale_id, line_index),
       FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
@@ -395,6 +399,12 @@ function ensureSchema(database) {
   if (!saleItemsColumns.includes('making_charge')) {
     database.exec("ALTER TABLE sale_items ADD COLUMN making_charge REAL NOT NULL DEFAULT 0;")
   }
+  if (!saleItemsColumns.includes('stone_weight')) {
+    database.exec("ALTER TABLE sale_items ADD COLUMN stone_weight REAL NOT NULL DEFAULT 0;")
+  }
+  if (!saleItemsColumns.includes('other_charges')) {
+    database.exec("ALTER TABLE sale_items ADD COLUMN other_charges REAL NOT NULL DEFAULT 0;")
+  }
 
   const productColumns = getColumnNames(database, 'products')
   const customerColumns = getColumnNames(database, 'customers')
@@ -419,11 +429,14 @@ async function openDatabase() {
     databasePromise = (async () => {
       const SQL = await getSqlJs()
       let database
+      const dbPath = getDatabasePath()
 
       try {
-        const fileBuffer = await fs.readFile(getDatabasePath())
+        const fileBuffer = await fs.readFile(dbPath)
         database = new SQL.Database(fileBuffer)
-      } catch {
+        console.log('[db] Loaded existing database from', dbPath)
+      } catch (error) {
+        console.error('[db] Could not read database file at', dbPath, '- creating new in-memory database. Error:', error?.message || error)
         database = new SQL.Database()
       }
 
@@ -436,8 +449,10 @@ async function openDatabase() {
 }
 
 async function persistDatabase(database) {
-  await fs.mkdir(path.dirname(getDatabasePath()), { recursive: true })
-  await fs.writeFile(getDatabasePath(), Buffer.from(database.export()))
+  const dbPath = getDatabasePath()
+  console.log('[db] Persisting database to', dbPath)
+  await fs.mkdir(path.dirname(dbPath), { recursive: true })
+  await fs.writeFile(dbPath, Buffer.from(database.export()))
 }
 
 function mapShop(row) {
@@ -543,9 +558,11 @@ async function loadData() {
       hsn: item.hsn,
       quantity: Number(item.quantity),
       grossWeight: Number(item.gross_weight),
+      stoneWeight: Number(item.stone_weight ?? 0),
       totalWeight: Number(item.total_weight),
       unitPrice: Number(item.unit_price),
       makingCharge: Number(item.making_charge ?? 0),
+      otherCharges: Number(item.other_charges ?? 0),
       lineTotal: Number(item.line_total),
     })),
     subtotal: Number(row.subtotal),
@@ -596,21 +613,12 @@ async function saveData(data) {
   database.run('BEGIN TRANSACTION')
 
   try {
-    database.run('DELETE FROM outstandings')
-    database.run('DELETE FROM sale_items')
-    database.run('DELETE FROM sales')
-    database.run('DELETE FROM purchases')
-    database.run('DELETE FROM suppliers')
-    database.run('DELETE FROM customers')
-    database.run('DELETE FROM products')
-    database.run('DELETE FROM shop_profile')
 
     database.run(
       `
         INSERT INTO shop_profile (
           id,
           shop_name,
-          owner_name,
           address,
           phone,
           email,
@@ -637,6 +645,19 @@ async function saveData(data) {
           $invoiceLogoDataUrl,
           $invoiceSaveDirectory
         )
+          ON CONFLICT(id) DO UPDATE SET
+          shop_name = excluded.shop_name,
+          address = excluded.address,
+          phone = excluded.phone,
+          email = excluded.email,
+          gstin = excluded.gstin,
+          currency = excluded.currency,
+          invoice_prefix = excluded.invoice_prefix,
+          invoice_sequence = excluded.invoice_sequence,
+          default_tax_rate = excluded.default_tax_rate,
+          invoice_terms = excluded.invoice_terms,
+          invoice_logo_data_url = excluded.invoice_logo_data_url,
+          invoice_save_directory = excluded.invoice_save_directory
       `,
       {
         $shopName: data.shop.shopName,
@@ -659,6 +680,16 @@ async function saveData(data) {
         `
           INSERT INTO products (id, hsn, name, category, purity, gross_weight, stone_weight, stock_qty, location, is_archived)
           VALUES ($id, $hsn, $name, $category, $purity, $grossWeight, $stoneWeight, $stockQty, $location, $isArchived)
+          ON CONFLICT(id) DO UPDATE SET
+          hsn=excluded.hsn,
+          name=excluded.name,
+          category=excluded.category,
+          purity=excluded.purity,
+          gross_weight=excluded.gross_weight,
+          stone_weight=excluded.stone_weight,
+          stock_qty=excluded.stock_qty,
+          location=excluded.location,
+          is_archived=excluded.is_archived
         `,
       ),
       data.products,
@@ -681,6 +712,14 @@ async function saveData(data) {
         `
           INSERT INTO customers (id, name, phone, email, city, address, outstanding, is_archived)
           VALUES ($id, $name, $phone, $email, $city, $address, $outstanding, $isArchived)
+          ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            phone = excluded.phone,
+            email = excluded.email,
+            city = excluded.city,
+            address = excluded.address,
+            outstanding = excluded.outstanding,
+            is_archived = excluded.is_archived
         `,
       ),
       data.customers,
@@ -701,6 +740,14 @@ async function saveData(data) {
         `
           INSERT INTO suppliers (id, name, phone, email, city, address, gstin, is_archived)
           VALUES ($id, $name, $phone, $email, $city, $address, $gstin, $isArchived)
+          ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            phone = excluded.phone,
+            email = excluded.email,
+            city = excluded.city,
+            address = excluded.address,
+            gstin = excluded.gstin,
+            is_archived = excluded.is_archived
         `,
       ),
       data.suppliers,
@@ -748,6 +795,19 @@ async function saveData(data) {
             $paidAmount,
             $notes
           )
+          ON CONFLICT(id) DO UPDATE SET
+            bill_number = excluded.bill_number,
+            date = excluded.date,
+            supplier_id = excluded.supplier_id,
+            supplier_name = excluded.supplier_name,
+            product_id = excluded.product_id,
+            product_name = excluded.product_name,
+            making_charge = excluded.making_charge,
+            total_weight = excluded.total_weight,
+            unit_cost = excluded.unit_cost,
+            total_cost = excluded.total_cost,
+            paid_amount = excluded.paid_amount,
+            notes = excluded.notes
         `,
       ),
       data.purchases,
@@ -808,6 +868,23 @@ async function saveData(data) {
             $paymentMode,
             $notes
           )
+          ON CONFLICT(id) DO UPDATE SET
+            invoice_number = excluded.invoice_number,
+            date = excluded.date,
+            customer_id = excluded.customer_id,
+            customer_name = excluded.customer_name,
+            customer_phone = excluded.customer_phone,
+            customer_address = excluded.customer_address,
+            tax_rate = excluded.tax_rate,
+            separate_rate_and_making_charge = excluded.separate_rate_and_making_charge,
+            subtotal = excluded.subtotal,
+            discount = excluded.discount,
+            tax_amount = excluded.tax_amount,
+            total = excluded.total,
+            paid_amount = excluded.paid_amount,
+            balance_amount = excluded.balance_amount,
+            payment_mode = excluded.payment_mode,
+            notes = excluded.notes
         `,
       ),
       data.sales,
@@ -843,9 +920,11 @@ async function saveData(data) {
             hsn,
             quantity,
             gross_weight,
+            stone_weight,
             total_weight,
             unit_price,
             making_charge,
+            other_charges,
             line_total
           ) VALUES (
             $saleId,
@@ -855,12 +934,26 @@ async function saveData(data) {
             $hsn,
             $quantity,
             $grossWeight,
+            $stoneWeight,
             $totalWeight,
             $unitPrice,
             $makingCharge,
+            $otherCharges,
             $lineTotal
           )
-        `,
+          ON CONFLICT(sale_id, line_index) DO UPDATE SET
+            product_id = excluded.product_id,
+            product_name = excluded.product_name,
+            hsn = excluded.hsn,
+            quantity = excluded.quantity,
+            gross_weight = excluded.gross_weight,
+            stone_weight = excluded.stone_weight,
+            total_weight = excluded.total_weight,
+            unit_price = excluded.unit_price,
+            making_charge = excluded.making_charge,
+            other_charges = excluded.other_charges,
+            line_total = excluded.line_total
+    `,
       ),
       data.sales.flatMap((sale) => sale.items.map((item, lineIndex) => ({ saleId: sale.id, lineIndex, item }))),
       ({ saleId, lineIndex, item }) => ({
@@ -871,9 +964,11 @@ async function saveData(data) {
         $hsn: item.hsn,
         $quantity: item.quantity,
         $grossWeight: item.grossWeight,
+        $stoneWeight: item.stoneWeight ?? 0,
         $totalWeight: item.totalWeight,
         $unitPrice: item.unitPrice,
         $makingCharge: item.makingCharge ?? 0,
+        $otherCharges: item.otherCharges ?? 0,
         $lineTotal: item.lineTotal,
       }),
     )
@@ -904,6 +999,16 @@ async function saveData(data) {
             $status,
             $settlementsJson
           )
+          ON CONFLICT(id) DO UPDATE SET
+            sale_id = excluded.sale_id,
+            invoice_number = excluded.invoice_number,
+            date = excluded.date,
+            customer_id = excluded.customer_id,
+            customer_name = excluded.customer_name,
+            balance_amount = excluded.balance_amount,
+            paid_amount = excluded.paid_amount,
+            status = excluded.status,
+            settlements_json = excluded.settlements_json
         `,
       ),
       data.outstandings,

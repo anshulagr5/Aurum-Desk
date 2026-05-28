@@ -2,6 +2,11 @@ const { app, BrowserWindow, dialog, ipcMain } = require('electron')
 const fs = require('node:fs/promises')
 const path = require('node:path')
 const { getDatabasePath, loadData, saveData } = require('./db.cjs')
+const { openDatabase } = require('./db.cjs') // export it
+
+
+// Ensure consistent app name so userData path is stable across dev and production
+app.name = 'Aurum Desk'
 
 function sanitizeFileName(fileName) {
   const cleaned = String(fileName ?? '')
@@ -86,4 +91,11 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit()
   }
+})
+
+app.on('before-quit', async (event) => {
+  event.preventDefault()
+    const db = await openDatabase()
+    await persistDatabase(db)
+  app.exit()
 })
